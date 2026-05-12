@@ -4,14 +4,12 @@ PFFT Miner Bot — Pow Free Fair Token
 Ethereum Mainnet | Contract: 0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB
 
 Usage:
-  python3 pfft_miner.py                    # Run with default wallet
-  PFFT_WALLET=/path/to/wallet.json python3 pfft_miner.py
-  ETH_RPC=https://... python3 pfft_miner.py
+  cp .env.example .env   # then set PRIVATE_KEY
+  python3 pfft_miner.py
 """
 
 import os
 import sys
-import json
 import time
 import struct
 import signal
@@ -32,7 +30,7 @@ if _env_path.exists():
 CONTRACT = "0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB"
 CHAIN_ID = 1
 RPC = os.environ.get("ETH_RPC", "https://ethereum-rpc.publicnode.com")
-WALLET_FILE = os.environ.get("PFFT_WALLET", os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallet.json"))
+PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 GAS_LIMIT = 200000
 PAUSE_BETWEEN_ROUNDS = 5
 
@@ -207,30 +205,16 @@ def main():
         sys.exit(1)
     print(f"✅ Connected | Block #{w3.eth.block_number}")
 
-    # Load/create wallet
-    wallet_path = Path(WALLET_FILE)
-    if wallet_path.exists():
-        with open(wallet_path) as f:
-            wdata = json.load(f)
-        pk = wdata.get('private_key_hex') or wdata.get('private_key')
-        if not pk.startswith('0x'):
-            pk = '0x' + pk
-        wallet = Account.from_key(pk)
-        print(f"✅ Wallet: {wallet.address}")
-    else:
-        wallet = Account.create()
-        wdata = {
-            "address": wallet.address,
-            "private_key_hex": wallet.key.hex(),
-            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "note": "PFFT miner wallet — KEEP SECRET"
-        }
-        wallet_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(wallet_path, 'w') as f:
-            json.dump(wdata, f, indent=2)
-        os.chmod(wallet_path, 0o600)
-        print(f"✅ New wallet: {wallet.address}")
-        print(f"   Saved: {wallet_path}")
+    # Load wallet from PRIVATE_KEY env var
+    pk = PRIVATE_KEY.strip()
+    if not pk or pk == "your_private_key_here":
+        print("❌ PRIVATE_KEY not set!")
+        print("   Copy .env.example → .env and set your private key")
+        sys.exit(1)
+    if not pk.startswith('0x'):
+        pk = '0x' + pk
+    wallet = Account.from_key(pk)
+    print(f"✅ Wallet: {wallet.address}")
 
     # ETH balance
     eth_bal = w3.eth.get_balance(wallet.address) / 1e18

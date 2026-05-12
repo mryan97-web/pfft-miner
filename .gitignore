@@ -1,8 +1,4 @@
-wallet.json
-*.json
 .env
-.env.*
-!.env.example
 __pycache__/
 *.pyc
 *.pyo
