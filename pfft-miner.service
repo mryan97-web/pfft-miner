@@ -1,0 +1,15 @@
+[Unit]
+Description=PFFT Miner Bot - Pow Free Fair Token
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.hermes/workspace/pfft-miner
+EnvironmentFile=-/root/.hermes/workspace/pfft-miner/.env
+ExecStart=/usr/bin/python3 /root/.hermes/workspace/pfft-miner/pfft_miner.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
