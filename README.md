@@ -302,6 +302,10 @@ tmux attach -t pfft-gpu
 
 ## 8. GPU tuning
 
+GPU miner starts from a random nonce every round. This is important because the
+contract can reject reused nonces; if the miner starts from 0 every round it may
+find the same valid nonce again and waste gas on a reverted duplicate mint.
+
 Default:
 
 ```bash

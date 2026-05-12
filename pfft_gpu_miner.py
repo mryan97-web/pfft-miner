@@ -21,6 +21,7 @@ Optional tuning env:
 from __future__ import annotations
 
 import os
+import secrets
 import signal
 import sys
 import time
@@ -337,7 +338,14 @@ def get_challenge(contract, wallet_addr):
     return challenge if isinstance(challenge, bytes) else challenge.to_bytes(32, "big")
 
 
-def solve_pow_gpu(np, cuda, kernel, challenge: bytes, target: int):
+def solve_pow_gpu(
+    np,
+    cuda,
+    kernel,
+    challenge: bytes,
+    target: int,
+    start_nonce_seed: int | None = None,
+):
     challenge_np = np.frombuffer(challenge, dtype=np.uint8).copy()
     target_np = np.frombuffer(target.to_bytes(32, "big"), dtype=np.uint8).copy()
     found_np = np.zeros(1, dtype=np.int32)
@@ -351,7 +359,11 @@ def solve_pow_gpu(np, cuda, kernel, challenge: bytes, target: int):
     cuda.memcpy_htod(challenge_gpu, challenge_np)
     cuda.memcpy_htod(target_gpu, target_np)
 
-    start_nonce = 0
+    # Important: do not start from 0 every round. Some contracts keep the same
+    # challenge while rejecting reused nonces, so deterministic scanning can find
+    # the exact same nonce again and waste gas on a reverted duplicate mint.
+    max_start = (2**64 - 1) - (GPU_BLOCKS * GPU_THREADS * GPU_BATCHES_PER_STATUS)
+    start_nonce = start_nonce_seed if start_nonce_seed is not None else secrets.randbelow(max_start)
     total_hashes = 0
     start_time = time.time()
     last_report = start_time
@@ -507,8 +519,17 @@ def main():
             continue
 
         challenge = get_challenge(contract, wallet.address)
+        start_nonce_seed = secrets.randbelow(2**64 - 1)
         print(f"  ⛏️  GPU mining ({status['difficulty_bits']}-bit)...")
-        nonce = solve_pow_gpu(np, cuda, kernel, challenge, status["target"])
+        print(f"  🎲 Start nonce: {start_nonce_seed}")
+        nonce = solve_pow_gpu(
+            np,
+            cuda,
+            kernel,
+            challenge,
+            status["target"],
+            start_nonce_seed=start_nonce_seed,
+        )
         if nonce is None:
             print("  Stopped before finding nonce")
             break
