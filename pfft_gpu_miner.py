@@ -17,9 +17,7 @@ Optional tuning env:
   GPU_THREADS=256
   GPU_BATCHES_PER_STATUS=32
 """
-
 from __future__ import annotations
-
 import os
 import secrets
 import signal
@@ -27,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-# Load .env file if present (no external dependency)
+# ── Load .env file if present (no external dependency) ─────────────────────────
 _env_path = Path(__file__).parent / ".env"
 if _env_path.exists():
     for _line in _env_path.read_text().splitlines():
@@ -36,24 +34,30 @@ if _env_path.exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip())
 
-CONTRACT = "0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB"
-CHAIN_ID = 1
-RPC = os.environ.get("ETH_RPC", "https://ethereum-rpc.publicnode.com")
+# ── Config ─────────────────────────────────────────────────────────────────────
+CONTRACT  = "0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB"
+CHAIN_ID  = 1
+RPC       = os.environ.get("ETH_RPC", "https://ethereum-rpc.publicnode.com")
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
-GAS_LIMIT = int(os.environ.get("GAS_LIMIT", "200000"))
-PAUSE_BETWEEN_ROUNDS = int(os.environ.get("PAUSE_BETWEEN_ROUNDS", "3"))
 
-GPU_BLOCKS = int(os.environ.get("GPU_BLOCKS", "65535"))
-GPU_THREADS = int(os.environ.get("GPU_THREADS", "256"))
+GAS_LIMIT            = int(os.environ.get("GAS_LIMIT",            "200000"))
+PAUSE_BETWEEN_ROUNDS = int(os.environ.get("PAUSE_BETWEEN_ROUNDS", "3"))
+GPU_BLOCKS           = int(os.environ.get("GPU_BLOCKS",           "65535"))
+GPU_THREADS          = int(os.environ.get("GPU_THREADS",          "256"))
 GPU_BATCHES_PER_STATUS = int(os.environ.get("GPU_BATCHES_PER_STATUS", "32"))
 
+# Precompute safe upper bound for random start nonce (avoids uint64 overflow)
+# GPU can scan up to (GPU_BLOCKS * GPU_THREADS * GPU_BATCHES_PER_STATUS) nonces
+# per status-check window, so we leave that headroom at the top of uint64.
+_NONCE_SCAN_WINDOW = GPU_BLOCKS * GPU_THREADS * GPU_BATCHES_PER_STATUS
+_MAX_START_NONCE   = (2**64 - 1) - _NONCE_SCAN_WINDOW
+
 running = True
-w3 = None
+w3      = None
 
-
+# ── CUDA kernel (Keccak-256 / keccak-256) ──────────────────────────────────────
 CUDA_SOURCE = r'''
 #include <stdint.h>
-
 #define ROL64(a, offset) (((a) << (offset)) ^ ((a) >> (64 - (offset))))
 
 __device__ __constant__ uint64_t RC[24] = {
@@ -74,9 +78,7 @@ __device__ __constant__ uint64_t RC[24] = {
 __device__ __forceinline__ uint64_t load64_le(const unsigned char *x) {
     uint64_t r = 0;
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        r |= ((uint64_t)x[i]) << (8 * i);
-    }
+    for (int i = 0; i < 8; i++) r |= ((uint64_t)x[i]) << (8 * i);
     return r;
 }
 
@@ -98,29 +100,22 @@ __device__ void keccakf(uint64_t st[25]) {
         12, 2, 20, 14, 22, 9, 6, 1
     };
     const int rotc[24] = {
-        1, 3, 6, 10, 15, 21, 28, 36,
-        45, 55, 2, 14, 27, 41, 56, 8,
+        1,  3,  6, 10, 15, 21, 28, 36,
+        45, 55,  2, 14, 27, 41, 56,  8,
         25, 43, 62, 18, 39, 61, 20, 44
     };
-
     for (int round = 0; round < 24; round++) {
         uint64_t bc[5];
+        #pragma unroll
+        for (int i = 0; i < 5; i++)
+            bc[i] = st[i] ^ st[i+5] ^ st[i+10] ^ st[i+15] ^ st[i+20];
 
         #pragma unroll
         for (int i = 0; i < 5; i++) {
-            bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+            uint64_t t = bc[(i+4)%5] ^ ROL64(bc[(i+1)%5], 1);
+            st[i]    ^= t; st[i+5]  ^= t; st[i+10] ^= t;
+            st[i+15] ^= t; st[i+20] ^= t;
         }
-
-        #pragma unroll
-        for (int i = 0; i < 5; i++) {
-            uint64_t t = bc[(i + 4) % 5] ^ ROL64(bc[(i + 1) % 5], 1);
-            st[i] ^= t;
-            st[i + 5] ^= t;
-            st[i + 10] ^= t;
-            st[i + 15] ^= t;
-            st[i + 20] ^= t;
-        }
-
         uint64_t t = st[1];
         #pragma unroll
         for (int i = 0; i < 24; i++) {
@@ -129,21 +124,16 @@ __device__ void keccakf(uint64_t st[25]) {
             st[j] = ROL64(t, rotc[i]);
             t = tmp;
         }
-
         #pragma unroll
         for (int j = 0; j < 25; j += 5) {
-            uint64_t row0 = st[j + 0];
-            uint64_t row1 = st[j + 1];
-            uint64_t row2 = st[j + 2];
-            uint64_t row3 = st[j + 3];
-            uint64_t row4 = st[j + 4];
-            st[j + 0] = row0 ^ ((~row1) & row2);
-            st[j + 1] = row1 ^ ((~row2) & row3);
-            st[j + 2] = row2 ^ ((~row3) & row4);
-            st[j + 3] = row3 ^ ((~row4) & row0);
-            st[j + 4] = row4 ^ ((~row0) & row1);
+            uint64_t r0 = st[j+0], r1 = st[j+1], r2 = st[j+2],
+                     r3 = st[j+3], r4 = st[j+4];
+            st[j+0] = r0 ^ ((~r1) & r2);
+            st[j+1] = r1 ^ ((~r2) & r3);
+            st[j+2] = r2 ^ ((~r3) & r4);
+            st[j+3] = r3 ^ ((~r4) & r0);
+            st[j+4] = r4 ^ ((~r0) & r1);
         }
-
         st[0] ^= RC[round];
     }
 }
@@ -165,15 +155,14 @@ __device__ bool digest_le_target(uint64_t st[25], const unsigned char *target) {
 }
 
 extern "C" __global__ void mine_kernel(
-    const unsigned char *challenge,
-    const unsigned char *target,
-    unsigned long long start_nonce,
-    unsigned long long *nonce_out,
-    int *found
+    const unsigned char   *challenge,
+    const unsigned char   *target,
+    unsigned long long     start_nonce,
+    unsigned long long    *nonce_out,
+    int                   *found
 ) {
-    unsigned long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long idx   = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long nonce = start_nonce + idx;
-
     if (found[0] != 0) return;
 
     uint64_t st[25];
@@ -181,20 +170,19 @@ extern "C" __global__ void mine_kernel(
     for (int i = 0; i < 25; i++) st[i] = 0ULL;
 
     // Message = challenge(32 bytes) + uint256 nonce(32 bytes, big-endian)
-    // Keccak rate is 136 bytes, so this is a single-block message.
+    // Keccak rate is 136 bytes → single-block message.
     st[0] = load64_le(challenge + 0);
     st[1] = load64_le(challenge + 8);
     st[2] = load64_le(challenge + 16);
     st[3] = load64_le(challenge + 24);
-    st[4] = 0ULL;
-    st[5] = 0ULL;
-    st[6] = 0ULL;
+    // Nonce occupies the high 8 bytes of the second 32-byte word (big-endian uint256)
     st[7] = bswap64(nonce);
 
-    // Keccak pad10*1 for 64-byte message: 0x01 at offset 64, 0x80 at offset 135.
-    st[8] ^= 0x0000000000000001ULL;
+    // Keccak pad10*1 for 64-byte message:
+    //   0x01 at byte offset 64  → lane 8, bit 0
+    //   0x80 at byte offset 135 → lane 16, bit 63
+    st[8]  ^= 0x0000000000000001ULL;
     st[16] ^= 0x8000000000000000ULL;
-
     keccakf(st);
 
     if (digest_le_target(st, target)) {
@@ -205,88 +193,41 @@ extern "C" __global__ void mine_kernel(
 }
 '''
 
-
+# ── ABI ────────────────────────────────────────────────────────────────────────
 ABI = [
-    {
-        "inputs": [],
-        "name": "currentPowHexZeros",
-        "outputs": [{"type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [],
-        "name": "totalMinted",
-        "outputs": [{"type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [],
-        "name": "MAX_SUPPLY",
-        "outputs": [{"type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "requested", "type": "uint256"}],
-        "name": "calculateActualMint",
-        "outputs": [{"type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "user", "type": "address"}],
-        "name": "currentPowChallenge",
-        "outputs": [{"type": "bytes32"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [
-            {"name": "user", "type": "address"},
-            {"name": "powNonce", "type": "uint256"},
-        ],
-        "name": "isValidPow",
-        "outputs": [{"type": "bool"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "powNonce", "type": "uint256"}],
-        "name": "freeMint",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "user", "type": "address"}],
-        "name": "mintedByAddress",
-        "outputs": [{"type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "account", "type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
+    {"inputs": [], "name": "currentPowHexZeros",
+     "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "totalMinted",
+     "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "MAX_SUPPLY",
+     "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "requested", "type": "uint256"}], "name": "calculateActualMint",
+     "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "user", "type": "address"}], "name": "currentPowChallenge",
+     "outputs": [{"type": "bytes32"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "user", "type": "address"}, {"name": "powNonce", "type": "uint256"}],
+     "name": "isValidPow",
+     "outputs": [{"type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "powNonce", "type": "uint256"}], "name": "freeMint",
+     "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"name": "user", "type": "address"}], "name": "mintedByAddress",
+     "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"name": "account", "type": "address"}], "name": "balanceOf",
+     "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
 ]
 
-
+# ── Signal handler ─────────────────────────────────────────────────────────────
 def handle_signal(sig, frame):
     del sig, frame
     global running
     print("\n  ⚠️  Stopping GPU miner...")
     running = False
 
-
+# ── GPU init ───────────────────────────────────────────────────────────────────
 def require_gpu():
     try:
         import numpy as np
-        import pycuda.autoinit  # noqa: F401
+        import pycuda.autoinit          # noqa: F401
         import pycuda.driver as cuda
         from pycuda.compiler import SourceModule
     except ImportError as exc:
@@ -303,71 +244,75 @@ def require_gpu():
     kernel = module.get_function("mine_kernel")
     return np, cuda, kernel
 
-
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def load_contract(web3):
-    return web3.eth.contract(address=web3.to_checksum_address(CONTRACT), abi=ABI)
-
+    return web3.eth.contract(
+        address=web3.to_checksum_address(CONTRACT), abi=ABI
+    )
 
 def get_status(web3, contract, wallet_addr):
-    hex_zeros = contract.functions.currentPowHexZeros().call()
+    hex_zeros    = contract.functions.currentPowHexZeros().call()
     total_minted = contract.functions.totalMinted().call()
-    max_supply = contract.functions.MAX_SUPPLY().call()
-    next_mint = contract.functions.calculateActualMint(
+    max_supply   = contract.functions.MAX_SUPPLY().call()
+    next_mint    = contract.functions.calculateActualMint(
         web3.to_wei(1000, "ether")
     ).call()
     wallet_minted = contract.functions.mintedByAddress(wallet_addr).call()
-    wallet_bal = contract.functions.balanceOf(wallet_addr).call()
-    target = (2**256 - 1) >> (hex_zeros * 4)
-    progress = total_minted * 10000 / max_supply / 100
-
+    wallet_bal    = contract.functions.balanceOf(wallet_addr).call()
+    target        = (2**256 - 1) >> (hex_zeros * 4)
+    progress      = total_minted * 10000 / max_supply / 100
     return {
-        "hex_zeros": hex_zeros,
+        "hex_zeros":      hex_zeros,
         "difficulty_bits": hex_zeros * 4,
-        "total_minted": total_minted,
-        "max_supply": max_supply,
-        "next_mint": next_mint,
-        "wallet_minted": wallet_minted,
-        "wallet_bal": wallet_bal,
-        "target": target,
-        "progress": progress,
+        "total_minted":   total_minted,
+        "max_supply":     max_supply,
+        "next_mint":      next_mint,
+        "wallet_minted":  wallet_minted,
+        "wallet_bal":     wallet_bal,
+        "target":         target,
+        "progress":       progress,
     }
 
-
-def get_challenge(contract, wallet_addr):
+def get_challenge(contract, wallet_addr) -> bytes:
     challenge = contract.functions.currentPowChallenge(wallet_addr).call()
     return challenge if isinstance(challenge, bytes) else challenge.to_bytes(32, "big")
 
+# ── Core GPU mining loop ───────────────────────────────────────────────────────
+def solve_pow_gpu(np, cuda, kernel, challenge: bytes, target: int) -> int | None:
+    """
+    Mine a valid PoW nonce on the GPU.
 
-def solve_pow_gpu(
-    np,
-    cuda,
-    kernel,
-    challenge: bytes,
-    target: int,
-    start_nonce_seed: int | None = None,
-):
+    Starts from a cryptographically random offset every call so that repeated
+    rounds with the same challenge never land on the same nonce (avoids the
+    'Duplicate POW nonce' revert).
+
+    The random seed is capped at _MAX_START_NONCE to leave room for the scan
+    window without wrapping past uint64 max.
+    """
     challenge_np = np.frombuffer(challenge, dtype=np.uint8).copy()
-    target_np = np.frombuffer(target.to_bytes(32, "big"), dtype=np.uint8).copy()
-    found_np = np.zeros(1, dtype=np.int32)
-    nonce_np = np.zeros(1, dtype=np.uint64)
+    target_np    = np.frombuffer(target.to_bytes(32, "big"), dtype=np.uint8).copy()
+    found_np     = np.zeros(1, dtype=np.int32)
+    nonce_np     = np.zeros(1, dtype=np.uint64)
 
     challenge_gpu = cuda.mem_alloc(challenge_np.nbytes)
-    target_gpu = cuda.mem_alloc(target_np.nbytes)
-    found_gpu = cuda.mem_alloc(found_np.nbytes)
-    nonce_gpu = cuda.mem_alloc(nonce_np.nbytes)
+    target_gpu    = cuda.mem_alloc(target_np.nbytes)
+    found_gpu     = cuda.mem_alloc(found_np.nbytes)
+    nonce_gpu     = cuda.mem_alloc(nonce_np.nbytes)
 
     cuda.memcpy_htod(challenge_gpu, challenge_np)
-    cuda.memcpy_htod(target_gpu, target_np)
+    cuda.memcpy_htod(target_gpu,    target_np)
 
-    # Important: do not start from 0 every round. Some contracts keep the same
-    # challenge while rejecting reused nonces, so deterministic scanning can find
-    # the exact same nonce again and waste gas on a reverted duplicate mint.
-    max_start = (2**64 - 1) - (GPU_BLOCKS * GPU_THREADS * GPU_BATCHES_PER_STATUS)
-    start_nonce = start_nonce_seed if start_nonce_seed is not None else secrets.randbelow(max_start)
+    # ── FIX: always start from a fresh random offset ──────────────────────────
+    # _MAX_START_NONCE = (2**64 - 1) - (GPU_BLOCKS * GPU_THREADS * GPU_BATCHES_PER_STATUS)
+    # Ensures start_nonce + scan_window never overflows uint64.
+    start_nonce = secrets.randbelow(_MAX_START_NONCE)
+    print(f"  🎲 Random start nonce: {start_nonce:,}")
+    # ──────────────────────────────────────────────────────────────────────────
+
+    batch_size   = GPU_BLOCKS * GPU_THREADS
     total_hashes = 0
-    start_time = time.time()
-    last_report = start_time
-    batch_size = GPU_BLOCKS * GPU_THREADS
+    start_time   = time.time()
+    last_report  = start_time
 
     while running:
         found_np[0] = 0
@@ -377,23 +322,21 @@ def solve_pow_gpu(
 
         for _ in range(GPU_BATCHES_PER_STATUS):
             kernel(
-                challenge_gpu,
-                target_gpu,
+                challenge_gpu, target_gpu,
                 np.uint64(start_nonce),
-                nonce_gpu,
-                found_gpu,
+                nonce_gpu, found_gpu,
                 block=(GPU_THREADS, 1, 1),
                 grid=(GPU_BLOCKS, 1),
             )
             cuda.Context.synchronize()
             cuda.memcpy_dtoh(found_np, found_gpu)
-
             total_hashes += batch_size
+
             if found_np[0]:
                 cuda.memcpy_dtoh(nonce_np, nonce_gpu)
                 elapsed = time.time() - start_time
-                rate = total_hashes / elapsed if elapsed > 0 else 0
-                nonce = int(nonce_np[0])
+                rate    = total_hashes / elapsed if elapsed > 0 else 0
+                nonce   = int(nonce_np[0])
                 print(
                     f"\n  ✅ FOUND nonce={nonce} | "
                     f"{total_hashes:,} checked | {rate:,.0f} H/s"
@@ -405,7 +348,7 @@ def solve_pow_gpu(
         now = time.time()
         if now - last_report >= 2:
             elapsed = now - start_time
-            rate = total_hashes / elapsed if elapsed > 0 else 0
+            rate    = total_hashes / elapsed if elapsed > 0 else 0
             print(
                 f"  ⚡ GPU {rate:,.0f} H/s | "
                 f"checked {total_hashes:,} | next nonce {start_nonce:,}",
@@ -413,24 +356,22 @@ def solve_pow_gpu(
             )
             last_report = now
 
-    return None
+    return None  # stopped by signal
 
-
+# ── Transaction submission ─────────────────────────────────────────────────────
 def submit_mint(web3, wallet, contract, nonce: int) -> bool:
     try:
         fn = contract.functions.freeMint(nonce)
-        tx = fn.build_transaction(
-            {
-                "from": wallet.address,
-                "nonce": web3.eth.get_transaction_count(wallet.address),
-                "chainId": CHAIN_ID,
-                "gas": GAS_LIMIT,
-            }
-        )
+        tx = fn.build_transaction({
+            "from":    wallet.address,
+            "nonce":   web3.eth.get_transaction_count(wallet.address),
+            "chainId": CHAIN_ID,
+            "gas":     GAS_LIMIT,
+        })
         if "maxFeePerGas" not in tx and "maxPriorityFeePerGas" not in tx:
             tx["gasPrice"] = web3.eth.gas_price
 
-        signed = wallet.sign_transaction(tx)
+        signed  = wallet.sign_transaction(tx)
         tx_hash = web3.eth.send_raw_transaction(signed.raw_transaction)
         print(f"  📤 TX: https://etherscan.io/tx/0x{tx_hash.hex()}")
 
@@ -441,11 +382,12 @@ def submit_mint(web3, wallet, contract, nonce: int) -> bool:
 
         print(f"  ❌ REVERTED | Gas {receipt.gasUsed}")
         return False
+
     except Exception as exc:
         print(f"  ❌ TX error: {exc}")
         return False
 
-
+# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     from eth_account import Account
     from web3 import Web3
@@ -454,9 +396,10 @@ def main():
 
     print("=" * 60)
     print("  🚀 PFFT GPU Miner Bot — NVIDIA CUDA")
-    print(f"  Contract: {CONTRACT}")
-    print(f"  RPC: {RPC}")
-    print(f"  GPU grid: {GPU_BLOCKS} blocks x {GPU_THREADS} threads")
+    print(f"  Contract : {CONTRACT}")
+    print(f"  RPC      : {RPC}")
+    print(f"  GPU grid : {GPU_BLOCKS} blocks × {GPU_THREADS} threads")
+    print(f"  Nonce window : {_NONCE_SCAN_WINDOW:,} per batch")
     print("=" * 60)
 
     global w3
@@ -474,18 +417,17 @@ def main():
     if not private_key.startswith("0x"):
         private_key = "0x" + private_key
 
-    wallet = Account.from_key(private_key)
-    print(f"✅ Wallet: {wallet.address}")
-
+    wallet  = Account.from_key(private_key)
     eth_bal = w3.eth.get_balance(wallet.address) / 1e18
-    print(f"💰 ETH: {eth_bal:.6f}")
+    print(f"✅ Wallet  : {wallet.address}")
+    print(f"💰 ETH     : {eth_bal:.6f}")
     if eth_bal < 0.00005:
         print("⚠️  Low ETH! Need ~0.00005+ ETH for gas")
 
-    contract = load_contract(w3)
-    total_mints = 0
-    total_pfft = 0.0
-    round_num = 0
+    contract     = load_contract(w3)
+    total_mints  = 0
+    total_pfft   = 0.0
+    round_num    = 0
     global_start = time.time()
 
     while running:
@@ -494,17 +436,18 @@ def main():
         print(f"  GPU Round #{round_num}")
         print(f"{'─' * 60}")
 
+        # ── Fetch on-chain status ──────────────────────────────────────────────
         try:
             status = get_status(w3, contract, wallet.address)
             print(
-                f"  Supply: {status['total_minted'] / 1e18:,.0f} "
+                f"  Supply  : {status['total_minted'] / 1e18:,.0f} "
                 f"({status['progress']:.1f}%) | "
                 f"Next: ~{status['next_mint'] / 1e18:,.2f} PFFT | "
                 f"Diff: {status['difficulty_bits']}-bit"
             )
             print(
-                f"  Wallet minted: {status['wallet_minted'] / 1e18:,.2f} / "
-                f"10,000 PFFT | Balance: {status['wallet_bal'] / 1e18:,.2f} PFFT"
+                f"  Wallet  : minted {status['wallet_minted'] / 1e18:,.2f} / 10,000 PFFT"
+                f" | bal {status['wallet_bal'] / 1e18:,.2f} PFFT"
             )
 
             if status["total_minted"] >= status["max_supply"]:
@@ -513,39 +456,36 @@ def main():
             if status["wallet_minted"] >= 10_000 * 1e18:
                 print("  🏁 Wallet cap (10,000 PFFT) reached!")
                 break
+
         except Exception as exc:
-            print(f"  ⚠️  Status error: {exc}, retrying in 15s...")
+            print(f"  ⚠️  Status error: {exc} — retrying in 15 s...")
             time.sleep(15)
             continue
 
+        # ── Mine ──────────────────────────────────────────────────────────────
         challenge = get_challenge(contract, wallet.address)
-        start_nonce_seed = secrets.randbelow(2**64 - 1)
         print(f"  ⛏️  GPU mining ({status['difficulty_bits']}-bit)...")
-        print(f"  🎲 Start nonce: {start_nonce_seed}")
-        nonce = solve_pow_gpu(
-            np,
-            cuda,
-            kernel,
-            challenge,
-            status["target"],
-            start_nonce_seed=start_nonce_seed,
-        )
+
+        nonce = solve_pow_gpu(np, cuda, kernel, challenge, status["target"])
+
         if nonce is None:
             print("  Stopped before finding nonce")
             break
 
+        # ── Validate before submitting ─────────────────────────────────────────
         try:
             valid = contract.functions.isValidPow(wallet.address, nonce).call()
             if not valid:
-                print("  ⚠️  Nonce invalid on-chain, restarting round...")
+                print("  ⚠️  Nonce invalid on-chain — restarting round...")
                 continue
         except Exception as exc:
-            print(f"  ⚠️  Verify error: {exc}, submitting anyway...")
+            print(f"  ⚠️  Verify error: {exc} — submitting anyway...")
 
+        # ── Submit ────────────────────────────────────────────────────────────
         if submit_mint(w3, wallet, contract, nonce):
             total_mints += 1
-            earned = status["next_mint"] / 1e18
-            total_pfft += earned
+            earned       = status["next_mint"] / 1e18
+            total_pfft  += earned
             print(
                 f"  💰 +{earned:,.2f} PFFT | "
                 f"Total: {total_pfft:,.2f} PFFT from {total_mints} mints"
@@ -556,19 +496,21 @@ def main():
             f"\n  📈 Session: {total_mints} mints | "
             f"{total_pfft:,.2f} PFFT | {elapsed / 60:.1f} min"
         )
+
         if running:
             print(f"  ⏳ {PAUSE_BETWEEN_ROUNDS}s cooldown...")
             time.sleep(PAUSE_BETWEEN_ROUNDS)
 
+    # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
     print("  GPU Session Summary")
-    print(f"  Mints: {total_mints}")
-    print(f"  PFFT earned: {total_pfft:,.2f}")
-    print(f"  Runtime: {(time.time() - global_start) / 60:.1f} min")
+    print(f"  Mints   : {total_mints}")
+    print(f"  PFFT    : {total_pfft:,.2f}")
+    print(f"  Runtime : {(time.time() - global_start) / 60:.1f} min")
     print(f"{'=' * 60}")
 
 
-signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGINT,  handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
 if __name__ == "__main__":
