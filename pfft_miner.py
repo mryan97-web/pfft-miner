@@ -37,7 +37,13 @@ PAUSE_BETWEEN_ROUNDS = 5
 # ---------------------------------------------------------------------------
 # Keccak256 (fast, using pycryptodome C extension)
 # ---------------------------------------------------------------------------
-from Crypto.Hash import keccak as _keccak_mod
+try:
+    from Crypto.Hash import keccak as _keccak_mod
+except ImportError:
+    print("❌ Missing dependency! Install with:")
+    print("   pip install -r requirements.txt")
+    print("   pip install pycryptodome web3")
+    sys.exit(1)
 
 def keccak256(data: bytes) -> bytes:
     return _keccak_mod.new(digest_bits=256, data=data).digest()
